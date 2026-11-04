@@ -1889,6 +1889,17 @@ impl ResponsesHttpExecutor<'_> {
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
             let stream_result = client.stream_request(request, options).await;
+            // Only an HTTP rejection before a stream exists is eligible for
+            // request-size recovery. A WebSocket error frame can carry the same
+            // status after output and must not acquire this marker.
+            let stream_result = stream_result.map_err(|error| {
+                let rejected_payload = matches!(
+                    &error,
+                    ApiError::Transport(TransportError::Http { status, .. })
+                        if *status == StatusCode::PAYLOAD_TOO_LARGE
+                );
+                (error, rejected_payload)
+            });
 
             match stream_result {
                 Ok(stream) => {
@@ -1901,7 +1912,7 @@ impl ResponsesHttpExecutor<'_> {
                         /*last_response_tx*/ None,
                     ));
                 }
-                Err(ApiError::Transport(unauthorized_transport))
+                Err((ApiError::Transport(unauthorized_transport), _))
                     if self
                         .client
                         .state
@@ -1929,10 +1940,21 @@ impl ResponsesHttpExecutor<'_> {
                     );
                     continue;
                 }
-                Err(err) => {
+                Err((err, rejected_payload)) => {
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
                     let err = self.client.state.provider.map_api_error(err);
+                    let err = if rejected_payload {
+                        if let codex_protocol::error::CodexErrorDetails::UnexpectedStatus(error) =
+                            err.details()
+                        {
+                            CodexErr::RequestPayloadTooLarge(error.clone())
+                        } else {
+                            err
+                        }
+                    } else {
+                        err
+                    };
                     inference_trace_attempt.record_failed(
                         &err,
                         response_debug_context.request_id.as_deref(),

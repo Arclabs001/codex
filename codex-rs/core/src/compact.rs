@@ -17,6 +17,9 @@ use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
+use crate::request_payload::active_turn_start_in_iter;
+use crate::request_payload::is_request_too_large;
+use crate::request_payload::reduce_historical_images_for_retry;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::RequestEffortUsage;
@@ -52,6 +55,7 @@ use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
 use codex_utils_output_truncation::approx_token_count;
@@ -61,6 +65,7 @@ use tracing::error;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+const MAX_PAYLOAD_RECOVERY_RETRIES: usize = 4;
 
 /// Thread-local policy that preserves inherited context without changing model or skill budgets.
 /// Insert into `StartThreadOptions::thread_extension_init` to disable automatic compaction.
@@ -146,6 +151,7 @@ pub(crate) async fn run_inline_auto_compact_task(
             CompactionImplementation::Responses,
             phase,
         ),
+        false,
     )
     .await?;
     Ok(())
@@ -169,9 +175,45 @@ pub(crate) async fn run_compact_task(
             CompactionImplementation::Responses,
             CompactionPhase::StandaloneTurn,
         ),
+        false,
     )
     .await?;
     Ok(())
+}
+
+/// Continue a remote compaction rejected before generation without rerunning its pre-hook.
+pub(crate) async fn run_payload_recovery_compact_task(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    replacement_step_context: Arc<StepContext>,
+    world_state: Arc<WorldState>,
+    trigger: CompactionTrigger,
+    phase: CompactionPhase,
+) -> CodexResult<()> {
+    let prompt = turn_context
+        .config
+        .compact_prompt
+        .as_deref()
+        .unwrap_or(SUMMARIZATION_PROMPT)
+        .to_string();
+    run_compact_task_inner(
+        sess,
+        turn_context,
+        replacement_step_context,
+        vec![UserInput::Text {
+            text: prompt,
+            text_elements: Vec::new(),
+        }],
+        world_state,
+        CompactionTurnMetadata::new(
+            trigger,
+            CompactionReason::RequestSize,
+            CompactionImplementation::Responses,
+            phase,
+        ),
+        true,
+    )
+    .await
 }
 
 async fn run_compact_task_inner(
@@ -181,6 +223,7 @@ async fn run_compact_task_inner(
     input: Vec<UserInput>,
     world_state: Arc<WorldState>,
     compaction_metadata: CompactionTurnMetadata,
+    pre_compact_hooks_already_run: bool,
 ) -> CodexResult<()> {
     let trigger = compaction_metadata.trigger();
     let reason = compaction_metadata.reason();
@@ -194,7 +237,11 @@ async fn run_compact_task_inner(
         phase,
     )
     .await;
-    let pre_compact_outcome = run_pre_compact_hooks(&sess, &turn_context, trigger).await;
+    let pre_compact_outcome = if pre_compact_hooks_already_run {
+        PreCompactHookOutcome::Continue
+    } else {
+        run_pre_compact_hooks(&sess, &turn_context, trigger).await
+    };
     match pre_compact_outcome {
         PreCompactHookOutcome::Continue => {}
         PreCompactHookOutcome::Stopped => {
@@ -275,8 +322,10 @@ async fn run_compact_task_inner_impl(
 
     let mut history = sess.clone_history().await;
     let input_goal_ids = UserGoalUpdate::message_ids(history.raw_items());
+    let mut compaction_input: ResponseItem = initial_input_for_turn.into();
+    compaction_input.set_turn_id_if_missing(&turn_context.sub_id);
     history.record_items(
-        &[initial_input_for_turn.into()],
+        &[compaction_input],
         turn_context.model_info().truncation_policy.into(),
     );
     let mut fallback_instructions = sess.get_prompt_base_instructions().await;
@@ -295,19 +344,53 @@ async fn run_compact_task_inner_impl(
     // Reuse one client session so turn-scoped state (sticky routing and websocket incremental
     // request tracking) survives retries within this compact turn.
     let mut client_session = sess.services.model_client.new_session();
+    let mut projected_input = None;
+    let mut payload_retries = 0;
+    let mut recovering_payload =
+        matches!(compaction_metadata.reason(), CompactionReason::RequestSize);
+    let mut omission_warning_sent = false;
+    // Capture before the summarizer records output under the active turn ID.
+    let source_history = sess.clone_history().await;
+    let source_items = source_history.annotated_items();
+    let recovery_active_start =
+        active_turn_start_in_iter(source_history.raw_items(), &turn_context.sub_id).or_else(|| {
+            matches!(
+                compaction_metadata.phase(),
+                CompactionPhase::StandaloneTurn
+                    | CompactionPhase::PreTurn
+                    | CompactionPhase::PostTurn
+            )
+            .then_some(source_items.len())
+        });
     let compaction_response = loop {
         // Clone is required because of the loop
-        let mut turn_input = history
-            .clone()
-            .for_prompt(
-                &turn_context.model_info().input_modalities,
-                sess.services.image_store.as_ref(),
-            )
-            .await;
+        let mut turn_input = if let Some(input) = projected_input.take() {
+            input
+        } else {
+            history
+                .clone()
+                .for_prompt(
+                    &turn_context.model_info().input_modalities,
+                    sess.services.image_store.as_ref(),
+                )
+                .await
+        };
         sess.services
             .executed_tool_calls
             .attach_to_compaction_prompt(&mut turn_input);
         let turn_input_len = turn_input.len();
+        if recovering_payload && !omission_warning_sent {
+            if recovery_active_start.is_none() {
+                return Err(CodexErr::InvalidRequest(
+                    "Cannot recover an oversized request without an identified active turn."
+                        .to_string(),
+                ));
+            }
+            sess.send_event(&turn_context, EventMsg::Warning(WarningEvent {
+                message: "The request exceeded the provider's payload limit. Compacting older context; historical image data may be omitted from the summary input. Originals remain in the thread history.".to_string(),
+            })).await;
+            omission_warning_sent = true;
+        }
         let base_instructions = if turn_input
             .iter()
             .any(|item| BaseInstructionsFragment::text_from_item(item).is_some())
@@ -328,6 +411,7 @@ async fn run_compact_task_inner_impl(
         let responses_metadata = sess
             .compaction_responses_metadata(turn_context.as_ref(), compaction_metadata)
             .await;
+        let mut payload_rejected_before_stream = false;
         let attempt_result = drain_to_completed(
             &sess,
             turn_context.as_ref(),
@@ -335,6 +419,8 @@ async fn run_compact_task_inner_impl(
             &responses_metadata,
             &prompt,
             compaction_metadata.phase(),
+            recovering_payload,
+            &mut payload_rejected_before_stream,
         )
         .await;
 
@@ -360,7 +446,17 @@ async fn run_compact_task_inner_impl(
             {
                 return Err(e);
             }
+            Err(e)
+                if recovering_payload
+                    && matches!(e.details(), CodexErrorDetails::InvalidRequest(_)) =>
+            {
+                return Err(e);
+            }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
+                if recovering_payload {
+                    // Payload recovery must not trim current input or split tool records.
+                    return Err(e);
+                }
                 if turn_input_len > 1 {
                     // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
                     error!(
@@ -373,8 +469,32 @@ async fn run_compact_task_inner_impl(
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
                 return Err(e);
             }
+            Err(e) if is_request_too_large(&e) => {
+                if !payload_rejected_before_stream
+                    || recovery_active_start.is_none()
+                    || payload_retries >= MAX_PAYLOAD_RECOVERY_RETRIES
+                {
+                    return Err(e);
+                }
+                let mut input = prompt.input;
+                if !reduce_historical_images_for_retry(&mut input, &turn_context.sub_id)
+                    .map_err(CodexErr::from)?
+                {
+                    // No smaller safe request exists; never replay the identical rejection.
+                    return Err(e);
+                }
+                recovering_payload = true;
+                payload_retries += 1;
+                projected_input = Some(input);
+                retries = 0;
+                continue;
+            }
+            Err(e) if e.http_status_code_value() == Some(413) => return Err(e),
             Err(e) => {
                 if retries < max_retries {
+                    if recovering_payload {
+                        projected_input = Some(prompt.input);
+                    }
                     retries += 1;
                     let delay = backoff(retries);
                     sess.notify_stream_error(
@@ -394,25 +514,38 @@ async fn run_compact_task_inner_impl(
 
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.annotated_items();
-    let summary_suffix = if matches!(compaction_metadata.phase(), CompactionPhase::PostTurn) {
+    let summary_suffix = if recovering_payload
+        || matches!(compaction_metadata.phase(), CompactionPhase::PostTurn)
+    {
         get_last_assistant_message_from_turn(compaction_response.output.iter())
             .filter(|summary| !summary.trim().is_empty())
             .ok_or_else(|| {
-                CodexErr::Stream(
-                    "Post-turn compaction completed without an assistant summary".to_string(),
-                )
+                CodexErr::Stream("Compaction completed without an assistant summary".to_string())
             })?
     } else {
         get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default()
     };
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
-    let user_messages = collect_annotated_user_messages(history_items);
+    let user_messages = if recovering_payload {
+        collect_annotated_user_messages(
+            &source_items[..recovery_active_start.expect("validated recovery boundary")],
+        )
+    } else {
+        collect_annotated_user_messages(history_items)
+    };
 
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
     if let Some(summary_item) = new_history.last_mut() {
         // This replacement history skips `record_conversation_items`; only the appended summary
         // belongs to this compaction turn.
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
+    }
+    if recovering_payload {
+        // The rejected active request has not run. Preserve its exact input, including
+        // image bodies and tool call/output pairs, after the historical summary.
+        new_history.extend_from_slice(
+            &source_items[recovery_active_start.expect("validated recovery boundary")..],
+        );
     }
     let (window_number, window_ids) = sess.advance_auto_compact_window().await;
 
@@ -830,9 +963,11 @@ async fn drain_to_completed(
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
     phase: CompactionPhase,
+    require_summary: bool,
+    payload_rejected_before_stream: &mut bool,
 ) -> CodexResult<CompactionResponse> {
     let mut includes_reasoning = turn_context.model_info().use_responses_lite;
-    let mut stream = client_session
+    let stream = client_session
         .stream(
             prompt,
             turn_context.model_info(),
@@ -849,7 +984,14 @@ async fn drain_to_completed(
             // are left untraced until the reducer has a first-class local compaction lifecycle.
             &InferenceTraceContext::disabled(),
         )
-        .await?;
+        .await;
+    let mut stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            *payload_rejected_before_stream = is_request_too_large(&error);
+            return Err(error);
+        }
+    };
     let mut output = Vec::new();
     loop {
         let maybe_event = stream.next().await;
@@ -873,8 +1015,11 @@ async fn drain_to_completed(
                 usage_metadata,
                 ..
             }) => {
-                if !matches!(phase, CompactionPhase::PostTurn) {
-                    for item in std::mem::take(&mut output) {
+                let missing_summary = require_summary
+                    && get_last_assistant_message_from_turn(output.iter())
+                        .is_none_or(|summary| summary.trim().is_empty());
+                if !missing_summary && !matches!(phase, CompactionPhase::PostTurn) {
+                    for item in output.iter().cloned() {
                         sess.record_annotated_conversation_items(
                             turn_context,
                             turn_context.model_info(),
@@ -902,6 +1047,11 @@ async fn drain_to_completed(
                     includes_reasoning,
                 )
                 .await?;
+                if missing_summary {
+                    return Err(CodexErr::InvalidRequest(
+                        "Compaction completed without an assistant summary.".to_string(),
+                    ));
+                }
                 return Ok(CompactionResponse {
                     response_id,
                     output,

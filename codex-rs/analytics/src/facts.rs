@@ -462,6 +462,7 @@ pub enum CompactionTrigger {
 pub enum CompactionReason {
     UserRequested,
     ContextLimit,
+    RequestSize,
     ModelDownshift,
     CompHashChanged,
 }

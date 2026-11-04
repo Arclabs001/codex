@@ -235,6 +235,40 @@ async fn run_remote_compact_task_inner(
         fallback,
     ))
     .await;
+    // A body-size rejection cannot be fixed by retrying the same remote
+    // compaction request. The local summarizer can progressively project old
+    // images out of its request while preserving the original active input.
+    if result
+        .as_ref()
+        .is_err_and(crate::request_payload::is_request_too_large)
+    {
+        attempt
+            .track(
+                sess.as_ref(),
+                codex_analytics::CompactionStatus::Failed,
+                result.as_ref().err(),
+                analytics_details,
+            )
+            .await;
+        if let Some(item) = started_item {
+            sess.emit_turn_item_completed(turn_context, item).await;
+        }
+        crate::tasks::emit_compact_metric(
+            &sess.services.session_telemetry,
+            "local",
+            matches!(trigger, CompactionTrigger::Manual),
+        );
+        crate::compact::run_payload_recovery_compact_task(
+            Arc::clone(sess),
+            Arc::clone(turn_context),
+            Arc::clone(replacement_step_context),
+            world_state,
+            trigger,
+            phase,
+        )
+        .await?;
+        return Ok(true);
+    }
     if matches!(result, Ok(false)) {
         if let Some(item) = started_item {
             sess.emit_turn_item_completed(turn_context, item).await;
@@ -356,6 +390,7 @@ async fn run_remote_compaction_request_v2(
         };
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
+            Err(err) if crate::request_payload::is_request_too_large(&err) => return Err(err),
             Err(err) => {
                 handle_response_stream_error(
                     &mut retry_state,

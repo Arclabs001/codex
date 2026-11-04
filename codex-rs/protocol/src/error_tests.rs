@@ -11,6 +11,34 @@ use http::StatusCode;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 
+#[test]
+fn payload_size_errors_are_not_transient_retries_and_keep_http_diagnostics() {
+    let response = UnexpectedResponseError {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        body: "request body too large".to_string(),
+        user_message: None,
+        url: None,
+        cf_ray: None,
+        request_id: Some("request-id".to_string()),
+        identity_authorization_error: None,
+        identity_error_code: None,
+    };
+    for error in [
+        CodexErr::RequestPayloadTooLarge(response.clone()),
+        CodexErr::UnexpectedStatus(response),
+    ] {
+        assert_eq!(error.retry_delay(1), None);
+        assert_eq!(error.http_status_code_value(), Some(413));
+        assert_eq!(
+            error.to_codex_protocol_error(),
+            CodexErrorInfo::HttpConnectionFailed {
+                http_status_code: Some(413),
+            },
+        );
+        assert!(error.to_string().contains("request-id"));
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn codex_err_debug_preserves_legacy_shape() {
     let actual = [

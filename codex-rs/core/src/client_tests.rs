@@ -115,6 +115,111 @@ use wiremock::matchers::path;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+#[tokio::test]
+async fn http_payload_rejection_is_marked_before_stream_and_not_retried() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(413)
+                .insert_header("x-request-id", "rejected-body")
+                .set_body_string("payload too large"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = false;
+    let mut client = test_model_client(SessionSource::Cli);
+    Arc::get_mut(&mut client.state).unwrap().provider = create_model_provider(provider, None);
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        Some("current-turn"),
+        format!("{}:0", client.state.thread_id),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let result = client
+        .new_session()
+        .stream(
+            &Prompt::default(),
+            &test_model_info(),
+            &test_session_telemetry(),
+            None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            None,
+            &metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await;
+    let error = result
+        .err()
+        .expect("HTTP 413 must fail before a stream exists");
+    assert!(crate::request_payload::is_request_too_large(&error));
+    assert_eq!(error.http_status_code_value(), Some(413));
+    assert_eq!(error.retry_delay(1), None);
+    assert!(error.to_string().contains("rejected-body"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_payload_error_after_output_does_not_acquire_handshake_marker()
+-> anyhow::Result<()> {
+    let response_error = codex_protocol::error::UnexpectedResponseError {
+        status: http::StatusCode::PAYLOAD_TOO_LARGE,
+        body: "websocket error frame".to_string(),
+        user_message: None,
+        url: None,
+        cf_ray: None,
+        request_id: None,
+        identity_authorization_error: None,
+        identity_error_code: None,
+    };
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    sender
+        .send(Ok(ResponseEvent::OutputItemDone(output_message(
+            "seen",
+            "already delivered",
+        ))))
+        .await?;
+    sender
+        .send(Err(ApiError::Transport(TransportError::Http {
+            status: response_error.status,
+            url: None,
+            headers: None,
+            body: Some(response_error.body),
+            retry_after: None,
+        })))
+        .await?;
+    drop(sender);
+    let mut stream = super::map_response_stream(
+        codex_api::ResponseStream {
+            routing_affinity: None,
+            rx_event: receiver,
+            upstream_request_id: None,
+            interrupt: None,
+        },
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled(),
+        test_model_provider(),
+        Vec::new(),
+        None,
+    );
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ResponseEvent::OutputItemDone(_)))
+    ));
+    let error = stream
+        .next()
+        .await
+        .expect("stream error")
+        .expect_err("must fail");
+    assert!(!crate::request_payload::is_request_too_large(&error));
+    assert_eq!(error.retry_delay(1), None);
+    Ok(())
+}
+
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_thread_id(ThreadId::new(), session_source)
 }

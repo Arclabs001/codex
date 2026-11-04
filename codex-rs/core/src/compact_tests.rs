@@ -24,6 +24,302 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use test_case::test_case;
 
+#[test_case(false,false,false; "successful recovery preserves active evidence")]
+#[test_case(true,false,false; "exhausted recovery preserves canonical history")]
+#[test_case(false,true,false; "missing summary preserves canonical history")]
+#[test_case(false,false,true; "transient reduced retry preserves projection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_compaction_http_413_projects_only_observed_historical_images(
+    reject_reduced_request: bool,
+    missing_summary: bool,
+    transient_after_reduction: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let provider = ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    let (session, turn, events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        Vec::new(),
+        move |config| {
+            config.model = Some("gpt-5.2".to_string());
+            config.model_provider = provider;
+            config.model_provider.supports_websockets = false;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(u64::from(transient_after_reduction));
+        },
+    )
+    .await;
+    let png = |seed: u8| -> anyhow::Result<String> {
+        let pixels = image::ImageBuffer::from_fn(64, 64, |x, y| {
+            let value = x
+                .wrapping_mul(73)
+                .wrapping_add(y.wrapping_mul(151))
+                .wrapping_add(u32::from(seed));
+            image::Rgba([
+                value as u8,
+                value.wrapping_mul(31) as u8,
+                (value ^ (x * y)) as u8,
+                255u8,
+            ])
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels).write_to(&mut bytes, image::ImageFormat::Png)?;
+        Ok(codex_utils_image::data_url_from_bytes(
+            "image/png",
+            bytes.get_ref(),
+        ))
+    };
+    let old_image = png(17)?;
+    let current_image = png(53)?;
+    let mut old_user: ResponseItem = serde_json::from_value(json!({
+        "type":"message","role":"user","content":[
+            {"type":"input_text","text":"Earlier image question"},
+            {"type":"input_image","image_url":old_image}
+        ]
+    }))?;
+    old_user.set_turn_id_if_missing("completed-turn");
+    let mut old_answer: ResponseItem = serde_json::from_value(json!({
+        "type":"message","role":"assistant","phase":"final_answer","status":"completed",
+        "content":[{"type":"output_text","text":"The earlier image showed a chart."}]
+    }))?;
+    old_answer.set_turn_id_if_missing("completed-turn");
+    let current_user: ResponseItem = serde_json::from_value(json!({
+        "type":"message","role":"user","content":[
+            {"type":"input_text","text":"Compare the current evidence"},
+            {"type":"input_image","image_url":current_image}
+        ]
+    }))?;
+    let current_call: ResponseItem = serde_json::from_value(json!({
+        "type":"function_call","call_id":"active-image-call","name":"view_image","arguments":"{}"
+    }))?;
+    let current_output: ResponseItem = serde_json::from_value(json!({
+        "type":"function_call_output","call_id":"active-image-call","output":[
+            {"type":"input_text","text":"Current tool observation"},
+            {"type":"input_image","image_url":current_image}
+        ]
+    }))?;
+    session
+        .record_conversation_items(
+            &turn,
+            turn.model_info(),
+            &[
+                old_user,
+                old_answer,
+                current_user,
+                current_call,
+                current_output,
+            ],
+        )
+        .await;
+    let original = session.clone_history().await;
+    let original_items: Vec<_> = original.raw_items().cloned().collect();
+    let current_tail: Vec<_> = original_items
+        .iter()
+        .filter(|item| item.turn_id() == Some(turn.sub_id.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(current_tail.len(), 3);
+    let rejected = wiremock::ResponseTemplate::new(413)
+        .set_body_json(json!({"error":{"code":"payload_too_large","message":"Payload rejected"}}));
+    let second = if reject_reduced_request {
+        rejected.clone()
+    } else if missing_summary {
+        responses::sse_response(responses::sse(vec![responses::ev_completed(
+            "empty-summary",
+        )]))
+    } else {
+        responses::sse_response(responses::sse(vec![
+            responses::ev_assistant_message("compact-summary", "Earlier evidence was a chart."),
+            responses::ev_completed("compact-ok"),
+        ]))
+    };
+    let responses = if transient_after_reduction {
+        vec![
+            rejected,
+            wiremock::ResponseTemplate::new(503)
+                .set_body_json(json!({"error":{"message":"Temporary failure"}})),
+            second,
+        ]
+    } else {
+        vec![rejected, second]
+    };
+    let mock = responses::mount_response_sequence(&server, responses).await;
+    let step = session
+        .capture_step_context(
+            Arc::clone(&turn),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+    let world = Arc::new(session.build_world_state_for_step(&step, true).await?);
+    let result = run_inline_auto_compact_task(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        step,
+        world,
+        CompactionReason::RequestSize,
+        CompactionPhase::MidTurn,
+    )
+    .await;
+    let requests = mock.requests();
+    assert_eq!(
+        requests.len(),
+        if transient_after_reduction { 3 } else { 2 },
+        "must retry only when a smaller safe request exists"
+    );
+    let first = requests[0].body_json();
+    let second = requests[1].body_json();
+    if transient_after_reduction {
+        assert_eq!(requests[2].body_json()["input"], second["input"]);
+    }
+    assert!(serde_json::to_vec(&second)?.len() < serde_json::to_vec(&first)?.len());
+    let input = second["input"].as_array().expect("input");
+    let replaced = input
+        .iter()
+        .find(|item| item["content"][0]["text"] == "Earlier image question")
+        .expect("old user retained");
+    assert_eq!(
+        replaced["content"][1]["text"],
+        crate::request_payload::OMITTED_IMAGE_NOTICE
+    );
+    assert_eq!(
+        input
+            .iter()
+            .find(|item| item["call_id"] == "active-image-call"
+                && item["type"] == "function_call_output")
+            .expect("active tool output")["output"][1]["image_url"],
+        current_image
+    );
+    let after = session.clone_history().await;
+    let after_items: Vec<_> = after.raw_items().cloned().collect();
+    if reject_reduced_request || missing_summary {
+        let error = result.expect_err("must stop");
+        if reject_reduced_request {
+            assert!(crate::request_payload::is_request_too_large(&error));
+        } else {
+            assert!(
+                matches!(error.details(),CodexErrorDetails::InvalidRequest(message) if message.contains("without an assistant summary"))
+            );
+        }
+        assert_eq!(
+            after_items, original_items,
+            "failed compaction must not rewrite history"
+        );
+    } else {
+        result?;
+        let current_start = after_items
+            .iter()
+            .position(|item| item == &current_tail[0])
+            .expect("current user preserved");
+        assert_eq!(&after_items[current_start..], current_tail.as_slice());
+        assert!(after_items[..current_start].iter().any(|item|matches!(item,ResponseItem::Message{content,..} if content_items_to_text(content).is_some_and(|text|text.contains("Earlier evidence was a chart.")))));
+    }
+    let mut warned = false;
+    while let Ok(event) = events.try_recv() {
+        warned |= matches!(event.msg,EventMsg::Warning(warning) if warning.message.contains("historical image"));
+    }
+    assert!(warned);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_compaction_http_413_bounds_shrinking_retries_and_preserves_history()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let provider = ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    let (session, turn, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        Vec::new(),
+        move |config| {
+            config.model_provider = provider;
+            config.model_provider.supports_websockets = false;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        },
+    )
+    .await;
+    let image = format!("data:image/png;base64,{}", "A".repeat(16_384));
+    let mut history = Vec::new();
+    for index in 0..32 {
+        let historical_turn = format!("completed-{index}");
+        for value in [
+            json!({"type":"message","role":"user","content":[
+                {"type":"input_text","text":format!("Earlier image {index}")},
+                {"type":"input_image","image_url":image}
+            ]}),
+            json!({"type":"message","role":"assistant","phase":"final_answer",
+                "content":[{"type":"output_text","text":"I observed this earlier image."}]}),
+        ] {
+            let mut item: ResponseItem = serde_json::from_value(value)?;
+            item.set_turn_id_if_missing(&historical_turn);
+            history.push(item);
+        }
+    }
+    let mut current: ResponseItem = serde_json::from_value(json!({
+        "type":"message","role":"user",
+        "content":[{"type":"input_text","text":"Continue the task"}]
+    }))?;
+    current.set_turn_id_if_missing(&turn.sub_id);
+    history.push(current);
+    // Install fixture records directly: this test exercises payload control flow,
+    // while the preceding image tests cover native PNG preparation.
+    session.replace_history(history, None).await;
+    let original = session.clone_history().await;
+    let original_items: Vec<_> = original.raw_items().cloned().collect();
+    let rejected = wiremock::ResponseTemplate::new(413)
+        .set_body_json(json!({"error":{"message":"Payload rejected"}}));
+    let mock = responses::mount_response_sequence(&server, vec![rejected; 5]).await;
+    let step = session
+        .capture_step_context(
+            Arc::clone(&turn),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+    let world = Arc::new(session.build_world_state_for_step(&step, true).await?);
+    let error = run_inline_auto_compact_task(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        step,
+        world,
+        CompactionReason::RequestSize,
+        CompactionPhase::MidTurn,
+    )
+    .await
+    .expect_err("the provider rejects every reduced attempt");
+    assert!(crate::request_payload::is_request_too_large(&error));
+    let requests = mock.requests();
+    assert_eq!(
+        requests.len(),
+        5,
+        "initial attempt plus at most four reductions"
+    );
+    for pair in requests.windows(2) {
+        let before = pair[0].body_json();
+        let after = pair[1].body_json();
+        assert!(serde_json::to_vec(&after)?.len() < serde_json::to_vec(&before)?.len());
+        assert_eq!(
+            before["input"].as_array().unwrap().len(),
+            after["input"].as_array().unwrap().len(),
+            "reducing payload must preserve every message"
+        );
+    }
+    assert!(
+        !requests
+            .last()
+            .unwrap()
+            .message_input_image_urls("user")
+            .is_empty(),
+        "the retry cap must stop even while more historical images remain"
+    );
+    let after = session.clone_history().await;
+    assert_eq!(
+        after.raw_items().cloned().collect::<Vec<_>>(),
+        original_items,
+        "exhausted recovery must not rewrite canonical history"
+    );
+    Ok(())
+}
+
 #[test_case(true; "metadata enabled")]
 #[test_case(false; "metadata disabled after capture")]
 #[tokio::test]

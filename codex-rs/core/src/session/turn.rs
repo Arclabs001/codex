@@ -488,6 +488,7 @@ pub(crate) async fn run_turn(
 
     let mut next_step_context = Some(first_step_context);
     let mut guardian_budget_compacted = false;
+    let mut request_size_compacted = false;
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -857,6 +858,44 @@ pub(crate) async fn run_turn(
                     }
                     break;
                 }
+                continue;
+            }
+            Err(err)
+                if auto_summarization_enabled
+                    && !request_size_compacted
+                    && crate::request_payload::is_request_too_large(&err)
+                    && {
+                        let input = sess
+                            .clone_history()
+                            .await
+                            .for_prompt(
+                                &step_context.settings.model_info.input_modalities,
+                                sess.services.image_store.as_ref(),
+                            )
+                            .await;
+                        crate::request_payload::has_recoverable_images(&input, &turn_context.sub_id)
+                    } =>
+            {
+                // A transport byte limit is independent of the model's token limit.
+                // Summarize once using the local recovery path, which can reduce
+                // historical image bodies if the summary request is also rejected.
+                request_size_compacted = true;
+                let world_state = Arc::new(
+                    sess.build_world_state_for_step(&step_context, /*new_window*/ true)
+                        .await?,
+                );
+                let _profile_guard = turn_context.turn_timing_state.begin_compaction();
+                emit_compact_metric(&sess.services.session_telemetry, "local", false);
+                run_inline_auto_compact_task(
+                    Arc::clone(&sess),
+                    Arc::clone(&turn_context),
+                    Arc::clone(&step_context),
+                    world_state,
+                    CompactionReason::RequestSize,
+                    CompactionPhase::MidTurn,
+                )
+                .await?;
+                can_drain_pending_input = false;
                 continue;
             }
             Err(err)
@@ -1896,6 +1935,9 @@ async fn run_sampling_request(
             Ok(output) => {
                 return Ok((output, notify_messages));
             }
+            // An unchanged retry cannot resolve an HTTP body-size rejection.
+            // Hand it to the turn loop before generic stream reconnection.
+            Err(err) if crate::request_payload::is_request_too_large(&err) => return Err(err),
             Err(err) => match err.details() {
                 CodexErrorDetails::ContextWindowExceeded => {
                     sess.set_total_tokens_full(&turn_context).await;

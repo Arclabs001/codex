@@ -18,6 +18,7 @@ pub(crate) fn should_retry_with_current_model(
             | CodexErrorDetails::Interrupted
             | CodexErrorDetails::SessionBudgetExceeded
             | CodexErrorDetails::ResponseIncomplete(_)
+            | CodexErrorDetails::RequestPayloadTooLarge(_)
     ) || (previous.model_info().slug == current.model_info().slug
         && previous.cyber_access_program == current.cyber_access_program)
     {
@@ -43,6 +44,7 @@ pub(crate) fn record_model_fallback(
     let reason_tag = match reason {
         CompactionReason::UserRequested => "user_requested",
         CompactionReason::ContextLimit => "context_limit",
+        CompactionReason::RequestSize => "request_size",
         CompactionReason::ModelDownshift => "model_downshift",
         CompactionReason::CompHashChanged => "comp_hash_changed",
     };

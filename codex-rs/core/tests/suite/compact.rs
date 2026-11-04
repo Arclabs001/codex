@@ -53,6 +53,7 @@ use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::test_path_buf;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_event_with_timeout;
 use std::path::PathBuf;
 
 use core_test_support::responses::ev_assistant_message;
@@ -100,6 +101,278 @@ const GLOBAL_AGENTS_OVERRIDE_FILENAME: &str = "AGENTS.override.md";
 const NEW_GLOBAL_INSTRUCTIONS: &str = "new global instructions";
 const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
 const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
+
+fn payload_test_image(seed: u8) -> Result<String> {
+    let pixels = image::ImageBuffer::from_fn(64, 64, |x, y| {
+        let value = x
+            .wrapping_mul(73)
+            .wrapping_add(y.wrapping_mul(151))
+            .wrapping_add(u32::from(seed));
+        image::Rgba([
+            value as u8,
+            value.wrapping_mul(31) as u8,
+            (value ^ (x * y)) as u8,
+            255u8,
+        ])
+    });
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(pixels).write_to(&mut encoded, image::ImageFormat::Png)?;
+    Ok(codex_utils_image::data_url_from_bytes(
+        "image/png",
+        encoded.get_ref(),
+    ))
+}
+
+#[test_case::test_case(false; "continues after recovered summary")]
+#[test_case::test_case(true; "second oversized request is terminal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_http_413_compacts_once_and_preserves_current_image(
+    reject_after_compaction: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let rejected = wiremock::ResponseTemplate::new(413).set_body_json(json!({
+        "error":{"code":"payload_too_large","message":"Payload rejected"}
+    }));
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_assistant_message("old-answer", "I observed the earlier chart."),
+                ev_completed("old-response"),
+            ])),
+            rejected.clone(),
+            rejected.clone(),
+            sse_response(sse(vec![
+                ev_assistant_message("summary-answer", "The earlier chart showed a trend."),
+                ev_completed("summary-response"),
+            ])),
+            if reject_after_compaction {
+                rejected
+            } else {
+                sse_response(sse(vec![
+                    ev_assistant_message("final-answer", "The current image is preserved."),
+                    ev_completed("final-response"),
+                ]))
+            },
+        ],
+    )
+    .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+        config.model_post_turn_compact_threshold_percent = 0;
+        config.model_auto_compact_token_limit = Some(i64::MAX);
+    });
+    let test = builder.build(&server).await?;
+    let earlier_image = payload_test_image(11)?;
+    let current_image = payload_test_image(29)?;
+    for (text, image) in [
+        ("Read the earlier chart", earlier_image),
+        ("Compare this current chart", current_image.clone()),
+    ] {
+        test.codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![
+                UserInput::Text {
+                    text: text.to_string(),
+                    text_elements: Vec::new(),
+                },
+                UserInput::Image {
+                    image: ImageReference::Inline { image_url: image },
+                    detail: None,
+                },
+            ]))
+            .await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+    }
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        5,
+        "one compaction recovery only, without identical ordinary retries"
+    );
+    let original = &requests[1];
+    let reduced = &requests[3];
+    assert!(
+        reduced
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text.contains("Historical image omitted"))
+    );
+    assert_eq!(original.message_input_image_urls("user").len(), 2);
+    assert_eq!(
+        reduced.message_input_image_urls("user"),
+        vec![current_image.clone()]
+    );
+    assert_eq!(
+        requests[4].message_input_image_urls("user"),
+        vec![current_image]
+    );
+    assert_eq!(
+        requests[4]
+            .message_input_texts("user")
+            .iter()
+            .filter(|text| text.as_str() == "Compare this current chart")
+            .count(),
+        1
+    );
+    assert!(
+        requests[4]
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text.contains("The earlier chart showed a trend."))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_http_413_with_only_current_image_does_not_compact() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            wiremock::ResponseTemplate::new(413)
+                .set_body_json(json!({"error":{"message":"Payload rejected"}})),
+        ],
+    )
+    .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+    });
+    let test = builder.build(&server).await?;
+    let current_image = payload_test_image(91)?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Text {
+                text: "Read this chart".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Image {
+                image: ImageReference::Inline {
+                    image_url: current_image.clone(),
+                },
+                detail: None,
+            },
+        ]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(request_log.requests().len(), 1);
+    assert_eq!(
+        request_log
+            .single_request()
+            .message_input_image_urls("user"),
+        vec![current_image]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_remote_http_413_recovers_locally_without_repeating_pre_hook() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let rejected = wiremock::ResponseTemplate::new(413)
+        .set_body_json(json!({"error":{"message":"Payload rejected"}}));
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_assistant_message("old-answer", "I observed the earlier chart."),
+                ev_completed("old-response"),
+            ])),
+            rejected.clone(),
+            rejected,
+            sse_response(sse(vec![
+                ev_assistant_message("summary-answer", "The earlier chart showed a trend."),
+                ev_completed("summary-response"),
+            ])),
+            sse_response(sse(vec![
+                ev_assistant_message("final-answer", "Continuing with the recovered context."),
+                ev_completed("final-response"),
+            ])),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(write_unsupported_blocking_pre_compact_hook)
+        .with_model_info_override("gpt-5.5", |model| model.use_responses_lite = true)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            trust_discovered_hooks(config);
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            config.model_post_turn_compact_threshold_percent = 0;
+            config.model_auto_compact_token_limit = Some(i64::MAX);
+        });
+    let test = builder.build(&server).await?;
+    let earlier_image = payload_test_image(37)?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Text {
+                text: "Read the earlier chart".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Image {
+                image: ImageReference::Inline {
+                    image_url: earlier_image.clone(),
+                },
+                detail: None,
+            },
+        ]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    test.submit_turn("Continue after manual recovery").await?;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests[1].input().last(),
+        Some(&json!({"type": "compaction_trigger"})),
+        "manual compaction must begin with the remote endpoint"
+    );
+    assert_eq!(
+        requests[2].message_input_image_urls("user"),
+        vec![earlier_image]
+    );
+    assert!(requests[3].message_input_image_urls("user").is_empty());
+    assert!(
+        requests[3]
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text.contains("Historical image omitted"))
+    );
+    assert!(
+        requests[4]
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text.contains("The earlier chart showed a trend."))
+    );
+    let hooks = read_hook_inputs(&test.codex_home_path().join("pre_compact_block_log.jsonl"));
+    assert_eq!(hooks.len(), 1, "local recovery must not rerun PreCompact");
+    assert_eq!(hooks[0]["trigger"], "manual");
+    Ok(())
+}
 
 fn ev_exec_command_call(call_id: &str, command: &str) -> serde_json::Value {
     ev_function_call(

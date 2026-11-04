@@ -151,6 +151,10 @@ pub enum CodexErrorDetails {
     /// Unexpected HTTP status code.
     #[error("{0}")]
     UnexpectedStatus(UnexpectedResponseError),
+    /// HTTP 413 received before the Responses stream was established.
+    /// Kept separate from WebSocket/stream errors that may follow model output.
+    #[error("{0}")]
+    RequestPayloadTooLarge(UnexpectedResponseError),
     /// Invalid request.
     #[error("{0}")]
     InvalidRequest(String),
@@ -382,6 +386,7 @@ impl CodexErr {
         Stream(message: String),
         ThreadNotFound(thread_id: ThreadId),
         UnexpectedStatus(error: UnexpectedResponseError),
+        RequestPayloadTooLarge(error: UnexpectedResponseError),
         InvalidRequest(message: String),
         UsageLimitReached(error: UsageLimitReachedError),
         ResponseStreamFailed(error: ResponseStreamFailed),
@@ -445,6 +450,7 @@ impl CodexErr {
             | CodexErrorDetails::Sandbox(_)
             | CodexErrorDetails::LandlockSandboxExecutableNotProvided
             | CodexErrorDetails::ContextWindowExceeded
+            | CodexErrorDetails::RequestPayloadTooLarge(_)
             | CodexErrorDetails::ThreadNotFound(_)
             | CodexErrorDetails::AgentLimitReached { .. }
             | CodexErrorDetails::Spawn
@@ -457,6 +463,13 @@ impl CodexErr {
             CodexErrorDetails::ServerOverloaded
             | CodexErrorDetails::PolicyCapacityUnavailable
             | CodexErrorDetails::RetryLimit(_) => self.server_retry_delay(),
+            // A stream/WebSocket payload rejection is not safe to replay.
+            // Only the separately marked HTTP handshake error may compact.
+            CodexErrorDetails::UnexpectedStatus(error)
+                if error.status == StatusCode::PAYLOAD_TOO_LARGE =>
+            {
+                None
+            }
             CodexErrorDetails::Stream(..)
             | CodexErrorDetails::ContentFilter
             | CodexErrorDetails::RateLimitExceeded(_)
@@ -526,7 +539,9 @@ impl CodexErr {
             CodexErrorDetails::RetryLimit(_) => CodexErrorInfo::ResponseTooManyFailedAttempts {
                 http_status_code: self.http_status_code_value(),
             },
-            CodexErrorDetails::ConnectionFailed(_) | CodexErrorDetails::UnexpectedStatus(_) => {
+            CodexErrorDetails::ConnectionFailed(_)
+            | CodexErrorDetails::UnexpectedStatus(_)
+            | CodexErrorDetails::RequestPayloadTooLarge(_) => {
                 CodexErrorInfo::HttpConnectionFailed {
                     http_status_code: self.http_status_code_value(),
                 }
@@ -572,7 +587,8 @@ impl CodexErr {
             CodexErrorDetails::FlexUnavailable => Some(StatusCode::TOO_MANY_REQUESTS),
             CodexErrorDetails::ModelNotFound { status, .. } => *status,
             CodexErrorDetails::RetryLimit(err) => Some(err.status),
-            CodexErrorDetails::UnexpectedStatus(err) => Some(err.status),
+            CodexErrorDetails::UnexpectedStatus(err)
+            | CodexErrorDetails::RequestPayloadTooLarge(err) => Some(err.status),
             CodexErrorDetails::ConnectionFailed(err) => err.source.status(),
             CodexErrorDetails::ResponseStreamFailed(err) => err.source.status(),
             _ => None,
